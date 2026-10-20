@@ -26,7 +26,8 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 
 ## Current state
 
-- All 32 tests pass on Python 3.13 and 3.9.6 (macOS, Apple Silicon). The original 21 also passed on 3.12 (Linux).
+- All 32 tests pass on Python 3.13, 3.11 and 3.9.6 (macOS, Apple Silicon). The original 21 also passed on 3.12 (Linux).
+- Launch on macOS was checked on 2026-10-20 under a real pty with fake `claude` and `codex` scripts on PATH. For both `baton to claude` and `baton to codex`, the agent replaced baton's process (same pid), got the prompt as its single argument, ran in the repo root, and kept a tty on stdin, stdout and stderr. Both real CLIs (native arm64 binaries) take a positional prompt: `claude [options] [command] [prompt]` and `codex [OPTIONS] [PROMPT]`.
 - Checked against Tim's real sessions on 2026-10-20 (37 Claude Code files, 87 Codex rollouts). The Claude parser matched as written. The Codex parser needed five fixes: skip subagent and guardian-review rollouts, keep a forked thread's own id, read commands and patches from code-mode `exec` cells, read exit codes from block-list outputs, and let a short `--session` prefix ignore child threads.
 - An end-to-end demo on a scratch git repo produced a correct 1.3 KB handoff with 0600 permissions and `.baton/` added to `.git/info/exclude`.
 - One bug was found and fixed during testing: `baton list` printed unredacted secret prefixes in its preview line. A regression test covers it.
@@ -48,8 +49,8 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 
 ## What is NOT verified yet (start here)
 
-1. **Launching via `os.execv` on macOS.** Reading and writing are verified on macOS; `baton to claude|codex` actually starting the agent is not.
-2. **Python 3.10 and 3.11.** 3.9, 3.12 and 3.13 pass.
+1. **A real agent session opened by baton.** The exec path is verified with fake agents (see Current state). Still unconfirmed: the real `claude` and `codex` starting interactively and acting on the prompt. That needs Tim to run it, since it starts a real session and uses quota.
+2. **Python 3.10.** 3.9, 3.11, 3.12 and 3.13 pass.
 3. **Windows.** The code path exists but is untested.
 4. **Formats keep moving.** Re-run against real sessions after Claude Code or Codex updates. Claude subagents now live in `projects/<dir>/<session-id>/subagents/`, which the top-level glob already ignores. Neither Claude `TodoWrite` nor Codex `update_plan` showed up in Tim's sessions, so the task list section will rarely appear.
 
