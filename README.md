@@ -45,11 +45,11 @@ Pulled by rules from the session, with no model involved:
 
 - the original request, the most recent requests, and the agent's last message
 - the agent's own task list (Claude `TodoWrite`, Codex `update_plan`) and its compaction summary if there is one
-- files it edited, last commands it ran, and recent errors (likely dead ends)
+- files it and its subagents edited (scratch files in temp folders are dropped), last commands it ran, and recent errors (likely dead ends)
 - live `git status`, diff stat and recent commits, read at the moment you run baton
 - your `-m` note
 
-It leaves out thinking blocks, subagent traffic, tool output (except short error tails), and Codex's injected environment and instruction messages. Typical size is 1 to 6 KB.
+It leaves out thinking blocks, subagent conversations (only their edited files are kept), tool output (except the start and end of errors), and Codex's injected environment and instruction messages. Typical size is 1 to 6 KB.
 
 ## Safety
 
@@ -63,6 +63,8 @@ It leaves out thinking blocks, subagent traffic, tool output (except short error
 
 - Claude Code: `~/.claude/projects/<project>/*.jsonl` (honors `CLAUDE_CONFIG_DIR`)
 - Codex: `~/.codex/sessions/**/rollout-*.jsonl` (honors `CODEX_HOME`), matched on the recorded working directory
+
+A session matches if it ran in the current folder, or anywhere inside the current git repo. Outside a git repo only exact folder matches count, so running baton from `~` doesn't pick up every project below it. `baton list` hides sessions that were opened but never got a message.
 
 These formats are internal and undocumented, so they can change. If a session parses to nothing, baton says so and lists the record types it saw instead of writing an empty handoff. Compressed `.zst` Codex rollouts are only read when you pass them with `--session`.
 

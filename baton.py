@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -81,8 +82,8 @@ _PLAIN_PATTERNS = [
 _URL_CREDS = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+(@)")
 # NAME_KEY=value, "password": "value", token: value
 _ASSIGN = re.compile(
-    r"(?i)\b([A-Za-z0-9_]*(?:key|secret|token|password|passwd|credential)[A-Za-z0-9_]*)"
-    r"(\"?\s*[=:]\s*)([\"']?)[^\s\"',;]{6,}"
+    r"(?i)\b([A-Za-z0-9_]*(?:key|secret|token(?!iz)|password|passwd|credential)[A-Za-z0-9_]*)"
+    r"(\"?\s*[=:]\s*)([\"']?)([^\s\"',;]{6,})"
 )
 MARK = "[REDACTED]"
 
@@ -112,6 +113,8 @@ class Redactor:
     def _assign(self, m: re.Match) -> str:
         if MARK in m.group(0):
             return m.group(0)
+        if m.group(1).lower().endswith("tokens") and m.group(4).rstrip(")}]").isdigit():
+            return m.group(0)  # a token count such as max_output_tokens: 8000, not a secret
         return self._tally(f"{m.group(1)}{m.group(2)}{m.group(3)}{MARK}")
 
 
@@ -131,6 +134,8 @@ class Session:
     users: list = field(default_factory=list)
     assistants: list = field(default_factory=list)
     files: dict = field(default_factory=dict)  # path -> touches, ordered by last touch
+    file_ts: dict = field(default_factory=dict)  # path -> timestamp of the last touch
+    subagents: int = 0  # subagent threads whose edits were merged in
     commands: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     todos: list = field(default_factory=list)  # (status, text)
@@ -143,6 +148,17 @@ class Session:
         path = (path or "").strip()
         if path:
             self.files[path] = self.files.pop(path, 0) + 1
+            self.file_ts[path] = self.ended
+
+    def merge_edits(self, child: "Session") -> None:
+        """Fold a subagent's edited files in, keeping most-recent-last order across both."""
+        if not child.files:
+            return
+        self.subagents += 1
+        for p, n in child.files.items():
+            self.files[p] = self.files.get(p, 0) + n
+            self.file_ts[p] = max(self.file_ts.get(p, ""), child.file_ts.get(p, ""))
+        self.files = dict(sorted(self.files.items(), key=lambda kv: self.file_ts.get(kv[0], "")))
 
     def note_meta(self, ts, cwd=None, branch=None) -> None:
         if isinstance(ts, str) and ts:
@@ -255,10 +271,10 @@ def _is_noise(text: str) -> bool:
 # Claude Code parser
 # --------------------------------------------------------------------------- #
 
-def parse_claude(path: Path) -> Session:
+def parse_claude(path: Path, sidechain: bool = False) -> Session:
     s = Session(agent="claude", path=path, session_id=path.stem)
     for obj in _records(path, s):
-        if obj.get("isSidechain"):
+        if obj.get("isSidechain") and not sidechain:
             continue  # subagent traffic
         t = obj.get("type")
         s.note_meta(obj.get("timestamp"), obj.get("cwd"), obj.get("gitBranch"))
@@ -551,45 +567,57 @@ def _codex_is_child(meta: dict) -> bool:
     )
 
 
-def _cwd_match(session_cwd: str, cwds: list) -> bool:
+def _cwd_match(session_cwd: str, cwds: list, root=None) -> bool:
+    """Exact match on any of cwds, or anywhere inside the git root. Never inside a plain folder like ~."""
     if not session_cwd:
         return False
     sc = _real(session_cwd)
-    for c in cwds:
-        if sc == c or c in Path(sc).parents:
-            return True
-    return False
+    return sc in cwds or bool(root and Path(root) in Path(sc).parents)
 
 
-def claude_candidates(cwds: list) -> list:
+def _claude_dir(path: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def claude_candidates(cwds: list, root=None) -> list:
     base = _claude_base()
     if not base.is_dir():
         return []
-    wanted = {re.sub(r"[^A-Za-z0-9]", "-", c) for c in cwds}
+    wanted = {_claude_dir(c) for c in cwds}
+    inside = _claude_dir(root) + "-" if root else None
     out = []
     for d in base.iterdir():
-        if d.is_dir() and d.name in wanted:
+        if not d.is_dir():
+            continue
+        if d.name in wanted:
             out.extend(d.glob("*.jsonl"))
+        elif inside and d.name.startswith(inside):  # maybe a subfolder of the repo; the encoding is lossy, so check
+            newest = sorted(d.glob("*.jsonl"), key=_mtime, reverse=True)[:1]
+            if newest and _cwd_match(_first_cwd(newest[0]), cwds, root):
+                out.extend(d.glob("*.jsonl"))
     if not out:  # the folder naming can drift between versions: match on the recorded cwd instead
         for d in base.iterdir():
             if not d.is_dir():
                 continue
             newest = sorted(d.glob("*.jsonl"), key=_mtime, reverse=True)[:1]
-            if newest and _cwd_match(_first_cwd(newest[0]), cwds):
+            if newest and _cwd_match(_first_cwd(newest[0]), cwds, root):
                 out.extend(d.glob("*.jsonl"))
     return out
 
 
-def codex_candidates(cwds: list) -> list:
+def _codex_recent() -> list:
     # Compressed (.zst) rollouts are old and expensive to scan; only --session reads them.
     base = _codex_base()
     if not base.is_dir():
         return []
-    files = sorted(base.rglob("rollout-*.jsonl"), key=_mtime, reverse=True)[:CODEX_SCAN_LIMIT]
+    return sorted(base.rglob("rollout-*.jsonl"), key=_mtime, reverse=True)[:CODEX_SCAN_LIMIT]
+
+
+def codex_candidates(cwds: list, root=None) -> list:
     out = []
-    for f in files:
+    for f in _codex_recent():
         meta = _head(f)
-        if _cwd_match(str(meta.get("cwd") or ""), cwds) and not _codex_is_child(meta):
+        if _cwd_match(str(meta.get("cwd") or ""), cwds, root) and not _codex_is_child(meta):
             out.append(f)
     return out
 
@@ -597,10 +625,34 @@ def codex_candidates(cwds: list) -> list:
 CANDIDATES = {"claude": claude_candidates, "codex": codex_candidates}
 
 
-def find_session(agents, cwds: list):
+def claude_children(s: Session) -> list:
+    d = s.path.parent / s.path.stem / "subagents"
+    return [(f, parse_claude(f, sidechain=True)) for f in sorted(d.glob("*.jsonl"), key=_mtime)] if d.is_dir() else []
+
+
+def codex_children(s: Session) -> list:
+    ids, out = {s.session_id}, []
+    for f in sorted(_codex_recent(), key=lambda f: f.name):  # names start with the start time, so parents come first
+        meta = _head(f)
+        if meta.get("parent_thread_id") in ids and meta.get("id"):
+            ids.add(str(meta["id"]))  # grandchildren too
+            out.append((f, parse_codex(f)))
+    return out
+
+
+CHILDREN = {"claude": claude_children, "codex": codex_children}
+
+
+def with_subagents(s: Session) -> Session:
+    for _, child in CHILDREN[s.agent](s):
+        s.merge_edits(child)
+    return s
+
+
+def find_session(agents, cwds: list, root=None):
     pool = []
     for a in agents:
-        for f in CANDIDATES[a](cwds):
+        for f in CANDIDATES[a](cwds, root):
             pool.append((_mtime(f), a, f))
     pool.sort(key=lambda x: x[0], reverse=True)
     for _, a, f in pool[:8]:
@@ -694,9 +746,18 @@ def clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + " [truncated]"
 
 
-def tail(text: str, limit: int) -> str:
+def ends(text: str, limit: int) -> str:
+    """Head and tail: errors put the cause first (permission denials) or last (tracebacks)."""
     text = (text or "").strip()
-    return text if len(text) <= limit else "[...] " + text[-limit:].lstrip()
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    return text[:head].rstrip() + " [...] " + text[-(limit - head):].lstrip()
+
+
+def _temp_dirs() -> tuple:
+    dirs = {tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"}
+    return tuple(d.rstrip(os.sep) + os.sep for d in dirs)
 
 
 def oneline(text: str, limit: int) -> str:
@@ -752,9 +813,12 @@ def render(s: Session, root: str, note: str, go: bool):
             L.append(f"- {marks.get(status, '[ ]')} {c(oneline(text, 160))}")
         L.append("")
 
-    if s.files:
-        items = list(reversed(list(s.files.items())))
-        L += ["## Files the previous agent edited (most recent first)", ""]
+    # Scratch files in temp folders mean nothing to the next agent, unless the repo itself lives there.
+    inside, temps = root.rstrip(os.sep) + os.sep, _temp_dirs()
+    items = [(p, n) for p, n in reversed(list(s.files.items())) if p.startswith(inside) or not p.startswith(temps)]
+    if items:
+        who = "the previous agent and its subagents" if s.subagents else "the previous agent"
+        L += [f"## Files {who} edited (most recent first)", ""]
         for p, n in items[:MAX_FILES]:
             L.append(f"- `{c(rel(p, root))}`" + (f" ({n}x)" if n > 1 else ""))
         if len(items) > MAX_FILES:
@@ -774,7 +838,7 @@ def render(s: Session, root: str, note: str, go: bool):
     if s.errors:
         L += ["## Recent errors (possible dead ends)", ""]
         for e in s.errors[-MAX_ERRORS:]:
-            flat = " / ".join(l.strip() for l in tail(e, MAX_ERROR_CHARS).splitlines() if l.strip())
+            flat = " / ".join(l.strip() for l in ends(e, MAX_ERROR_CHARS).splitlines() if l.strip())
             L.append(f"- `{c(flat).replace('`', chr(39))}`")
         L.append("")
 
@@ -878,28 +942,34 @@ def main(argv=None) -> int:
 
 def _run(args, mode: str, target) -> int:
     cwd = _real(os.getcwd())
-    root = git_root(cwd) or cwd
+    groot = git_root(cwd)
+    root = groot or cwd
     cwds = list(dict.fromkeys([cwd, root, os.getcwd()]))
 
     if mode == "list":
         rows = []
         for a in AGENTS:
-            rows += [(_mtime(f), a, f) for f in CANDIDATES[a](cwds)]
+            rows += [(_mtime(f), a, f) for f in CANDIDATES[a](cwds, groot)]
         rows.sort(key=lambda x: x[0], reverse=True)
-        if not rows:
+        shown = 0
+        for mt, a, f in rows:
+            s = PARSERS[a](f)
+            if not s.users:  # opened and closed without a message: nothing to hand off
+                continue
+            print(f"{a:<7} {s.session_id[:8]}  {_ago(mt):<10} {oneline(Redactor().clean(s.users[0]), 60)}")
+            shown += 1
+            if shown == 10:
+                break
+        if not shown:
             print(f"No Claude Code or Codex sessions found for {cwd}")
             return 1
-        for mt, a, f in rows[:10]:
-            s = PARSERS[a](f)
-            first = oneline(Redactor().clean(s.users[0]), 60) if s.users else "(no messages)"
-            print(f"{a:<7} {s.session_id[:8]}  {_ago(mt):<10} {first}")
         return 0
 
     if target and args.source == target:
         raise BatonError("--from and the target agent are the same.")
     sources = (args.source,) if args.source else tuple(a for a in AGENTS if a != target)
 
-    s = load_explicit(args.session) if args.session else find_session(sources, cwds)
+    s = load_explicit(args.session) if args.session else find_session(sources, cwds, groot)
     if s is None:
         where = " or ".join(LABELS[a] for a in sources)
         raise BatonError(
@@ -909,7 +979,7 @@ def _run(args, mode: str, target) -> int:
     if target and s.agent == target:
         raise BatonError(f"That session is from {LABELS[target]} itself. Pick another with --session or --from.")
 
-    text, redacted = render(s, root, args.note, args.go)
+    text, redacted = render(with_subagents(s), root, args.note, args.go)
     say = (lambda m: print(m, file=sys.stderr)) if args.stdout else print
 
     if s.bad_lines and s.bad_lines > max(3, s.records // 10):

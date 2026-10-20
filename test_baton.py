@@ -124,14 +124,29 @@ def codex_code_mode_rows(cwd, sid=CODEX_USER_ID):
     ]
 
 
-def codex_child_rows(cwd):
-    # A forked subagent thread: its own session_meta, then the parent's, then the copied parent history.
-    own = {"id": CODEX_CHILD_ID, "cwd": cwd, "thread_source": "subagent", "parent_thread_id": CODEX_USER_ID,
-           "source": {"subagent": {"thread_spawn": {"parent_thread_id": CODEX_USER_ID, "agent_role": "builder"}}}}
-    rows = codex_code_mode_rows(cwd)
-    return [{"type": "session_meta", "payload": own}] + rows + [
-        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": "CHILD TASK: build the store"}]}}]
+def codex_child_rows(cwd, sid=CODEX_CHILD_ID, parent=CODEX_USER_ID):
+    # A forked subagent thread: its own session_meta, then the parent's, then copied parent messages (real forks
+    # copy messages but not tool calls), then its own work.
+    own = {"id": sid, "cwd": cwd, "thread_source": "subagent", "parent_thread_id": parent,
+           "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent, "agent_role": "builder"}}}}
+    copied = [r for r in codex_code_mode_rows(cwd) if r["type"] == "session_meta" or r["payload"].get("type") == "message"]
+    patch = "*** Begin Patch\n*** Add File: src/child.py\n+x\n*** End Patch\n"
+    return [{"timestamp": "2026-10-20T02:05:00Z", "type": "session_meta", "payload": own}] + copied + [
+        {"timestamp": "2026-10-20T02:05:10Z", "type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "CHILD TASK: build the store"}]}},
+        {"timestamp": "2026-10-20T02:06:00Z", "type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "exec", "call_id": "k1",
+            "input": f"text(await tools.apply_patch({json.dumps(patch)}));"}}]
+
+
+def claude_subagent_rows(cwd):
+    return [
+        {"type": "user", "isSidechain": True, "agentId": "a1", "cwd": cwd, "timestamp": "2026-10-20T01:40:00.000Z",
+         "message": {"role": "user", "content": "Write the burst test"}},
+        {"type": "assistant", "isSidechain": True, "agentId": "a1", "timestamp": "2026-10-20T01:41:00.000Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Write", "input": {"file_path": f"{cwd}/tests/test_burst.py"}}]}},
+    ]
 
 
 class ParserTests(unittest.TestCase):
@@ -197,6 +212,40 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(baton.parse_codex(f).session_id, CODEX_CHILD_ID)
         self.assertTrue(baton._codex_is_child(baton._head(f)))
 
+    def test_merge_subagent_edits_by_time(self):
+        f = self.tmp / "abc123.jsonl"
+        jl(f, claude_rows("/w"))
+        g = self.tmp / "abc123" / "subagents" / "agent-a1.jsonl"
+        jl(g, claude_subagent_rows("/w") + [
+            {"type": "assistant", "isSidechain": True, "timestamp": "2026-10-20T01:00:30.000Z", "message": {
+                "role": "assistant", "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/w/src/app.py"}}]}}])
+        s = baton.with_subagents(baton.parse_claude(f))
+        self.assertEqual(s.subagents, 1)
+        self.assertEqual(s.files["/w/src/app.py"], 3)
+        self.assertEqual(list(s.files)[-1], "/w/tests/test_burst.py")  # newest touch overall
+        self.assertEqual(len(s.users), 2)  # subagent prompts never count as the user's requests
+
+    def test_render_drops_temp_files_and_keeps_both_ends_of_errors(self):
+        tmp = baton.tempfile.gettempdir()
+        s = baton.Session(agent="claude", path=Path("x.jsonl"), session_id="abcd1234", users=["do it"])
+        for p in ("/repo/src/a.py", f"{tmp}/claude-501/scratchpad/seed.py", "/private/tmp/x/seed2.py", "/etc/hosts", "rel/b.py"):
+            s.touch(p)
+        s.errors = ["Permission for this action was denied. Reason: writes outside the repo." + " filler" * 100 + " LAST LINE"]
+        text, _ = baton.render(s, "/repo", "", False)
+        self.assertIn("`src/a.py`", text)
+        self.assertIn("`/etc/hosts`", text)
+        self.assertIn("`rel/b.py`", text)
+        self.assertNotIn("seed", text)
+        self.assertIn("Permission for this action was denied", text)
+        self.assertIn("LAST LINE", text)
+        self.assertIn(" [...] ", text)
+
+    def test_cwd_match_scope(self):
+        self.assertTrue(baton._cwd_match("/r", ["/r"]))
+        self.assertFalse(baton._cwd_match("/r/sub", ["/r"]))  # not a git root: exact only
+        self.assertTrue(baton._cwd_match("/r/sub", ["/r"], root="/r"))
+        self.assertFalse(baton._cwd_match("/rr", ["/r"], root="/r"))
+
     def test_js_string_literals(self):
         self.assertEqual(baton._js_str(r'"a \"b\"\nc"'), 'a "b"\nc')
         self.assertEqual(baton._js_str(r"'it\'s'"), "it's")
@@ -238,9 +287,14 @@ class RedactionTests(unittest.TestCase):
             out = r.clean(f"before {text} after")
             self.assertIn("[REDACTED]", out, text)
             self.assertGreaterEqual(r.count, 1, text)
-        r = baton.Redactor()
-        self.assertEqual(r.clean("plain text, max_tokens: 4096, nothing here"), "plain text, max_tokens: 4096, nothing here")
-        self.assertEqual(r.count, 0)
+        for text in ["password: 12345678", "API_TOKENS=abcdef123456", "tokenizer_secret=abcdefgh123",
+                     "auth_token=ab)cd)ef12", 'max_output_tokens: "8000abcdef"']:
+            self.assertIn("[REDACTED]", baton.Redactor().clean(text), text)
+        for text in ["plain text, max_tokens: 4096, nothing here", "tokenizer: whitespace",
+                     'exec_command({cmd:"ls",max_output_tokens:8000});', "max_tokens: 1000000", '"num_tokens": 123456}']:
+            r = baton.Redactor()
+            self.assertEqual(r.clean(text), text)
+            self.assertEqual(r.count, 0, text)
 
     def test_no_double_count(self):
         r = baton.Redactor()
@@ -355,12 +409,56 @@ class EndToEnd(unittest.TestCase):
         code, out, _ = self.call("--stdout")
         self.assertIn("Refactor the auth module", out)
         self.assertNotIn("CHILD TASK", out)
+        self.assertIn("the previous agent and its subagents", out)
+        self.assertIn("`src/child.py`", out)  # the child's edit is merged into the parent's handoff
+        self.assertIn("`src/auth.py`", out)
         code, out, err = self.call("--stdout", "--session", CODEX_USER_ID[:8])  # the prefix both ids share
         self.assertEqual(code, 0, err)
         self.assertNotIn("CHILD TASK", out)
         code, out, err = self.call("--stdout", "--session", CODEX_CHILD_ID)  # still readable when asked for
         self.assertEqual(code, 0, err)
         self.assertIn("CHILD TASK", out)
+
+    def test_claude_subagent_edits_reach_the_handoff(self):
+        enc = re.sub(r"[^A-Za-z0-9]", "-", str(self.repo))
+        jl(self.claude / "projects" / enc / "abcd1234-0000-4000-8000-000000000001" / "subagents" / "agent-a1.jsonl",
+           claude_subagent_rows(str(self.repo)))
+        code, out, _ = self.call("--stdout")
+        self.assertIn("the previous agent and its subagents", out)
+        self.assertIn("`tests/test_burst.py`", out)
+        self.assertNotIn("Write the burst test", out)
+
+    def test_sessions_started_in_a_repo_subfolder(self):
+        (self.repo / "app").mkdir()
+        sub = str(self.repo / "app")
+        jl(self.codex / "sessions" / "2026" / "10" / "20" / f"rollout-2026-10-20T02-00-00-{CODEX_USER_ID}.jsonl",
+           codex_code_mode_rows(sub))
+        enc = re.sub(r"[^A-Za-z0-9]", "-", sub)
+        jl(self.claude / "projects" / enc / "abcd1234-0000-4000-8000-000000000009.jsonl", claude_rows(sub))
+        code, out, _ = self.call("list")
+        self.assertIn(CODEX_USER_ID[:8], out)
+        self.assertIn("abcd1234", out)
+        self.assertEqual(out.count("\n"), 3, out)  # repo root session, subfolder Claude session, subfolder Codex session
+
+    def test_plain_folder_does_not_match_sessions_below_it(self):
+        sub = self.tmp / "plain" / "proj"
+        sub.mkdir(parents=True)
+        jl(self.codex / "sessions" / "2026" / "10" / "20" / f"rollout-2026-10-20T02-00-00-{CODEX_USER_ID}.jsonl",
+           codex_code_mode_rows(str(Path(os.path.realpath(sub)))))
+        os.chdir(self.tmp / "plain")
+        code, out, _ = self.call("list")
+        self.assertEqual(code, 1, out)
+
+    def test_list_hides_empty_sessions(self):
+        enc = re.sub(r"[^A-Za-z0-9]", "-", str(self.repo))
+        empty = self.claude / "projects" / enc / "eeee0000-0000-4000-8000-000000000002.jsonl"
+        jl(empty, [{"type": "permission-mode", "permissionMode": "default", "sessionId": "eeee0000"}])
+        future = os.path.getmtime(empty) + 100
+        os.utime(empty, (future, future))
+        code, out, _ = self.call("list")
+        self.assertNotIn("eeee0000", out)
+        self.assertNotIn("(no messages)", out)
+        self.assertIn("abcd1234", out)
 
     def test_list(self):
         code, out, _ = self.call("list")

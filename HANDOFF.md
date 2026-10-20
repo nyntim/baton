@@ -20,13 +20,13 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 ## Files
 
 - `baton.py`: the whole tool. Single file, Python 3.9+ target, standard library only, no network.
-- `test_baton.py`: 25 unittest tests. The Claude Code and code-mode Codex fixtures use record shapes copied from real 2026-10 sessions; the older Codex fixture is kept for older rollouts. Run with `python3 -m unittest test_baton`.
+- `test_baton.py`: 32 unittest tests. The Claude Code and code-mode Codex fixtures use record shapes copied from real 2026-10 sessions; the older Codex fixture is kept for older rollouts. Run with `python3 -m unittest test_baton`.
 - `README.md`: user-facing docs.
 - `HANDOFF.md`: this file.
 
 ## Current state
 
-- All 25 tests pass on Python 3.12 (Linux), 3.13 and 3.9.6 (macOS, Apple Silicon).
+- All 32 tests pass on Python 3.12 (Linux), 3.13 and 3.9.6 (macOS, Apple Silicon).
 - Checked against Tim's real sessions on 2026-10-20 (37 Claude Code files, 87 Codex rollouts). The Claude parser matched as written. The Codex parser needed five fixes: skip subagent and guardian-review rollouts, keep a forked thread's own id, read commands and patches from code-mode `exec` cells, read exit codes from block-list outputs, and let a short `--session` prefix ignore child threads.
 - An end-to-end demo on a scratch git repo produced a correct 1.3 KB handoff with 0600 permissions and `.baton/` added to `.git/info/exclude`.
 - One bug was found and fixed during testing: `baton list` printed unredacted secret prefixes in its preview line. A regression test covers it.
@@ -34,14 +34,15 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 ## How it works (map of baton.py)
 
 - **CLI** (`main`, `_run`): `baton`, `baton to claude|codex`, `baton list`, plus `-m`, `--from`, `--session`, `--out`, `--stdout`, `--go`, `--no-launch`. `to X` reads the newest session from the *other* agent. Launch uses `os.execv` on POSIX and `subprocess.call` on Windows.
-- **Discovery** (`claude_candidates`, `codex_candidates`, `find_session`): matches sessions to the current directory, its realpath, and the git root. Picks the newest file across agents that has at least one real user message, trying up to 8 files.
+- **Discovery** (`claude_candidates`, `codex_candidates`, `find_session`): matches sessions to the current directory, its realpath, and the git root exactly, or anywhere inside the git root (never inside a plain folder such as `~`). Picks the newest file across agents that has at least one real user message, trying up to 8 files.
   - Claude: `$CLAUDE_CONFIG_DIR` or `~/.claude`, under `projects/<cwd with non-alphanumerics replaced by '-'>/*.jsonl`. Falls back to scanning every project folder for a matching recorded `cwd`.
   - Codex: `$CODEX_HOME` or `~/.codex`, under `sessions/**/rollout-*.jsonl`. Matches the `cwd` in the first lines; the newest 300 files are scanned. `.zst` files are skipped in discovery and only readable via `--session`. Child threads (`parent_thread_id`, `thread_source` other than `user`, or a dict `source`) are skipped.
 - **Parsers** (`parse_claude`, `parse_codex`): normalize both formats into a `Session` with users, assistants, edited files, commands, errors, todos, and the compaction summary.
   - Claude: skips `isSidechain`, `isMeta`, thinking blocks, and slash-command/system-reminder noise. Reads `Edit`/`Write`/`MultiEdit`/`NotebookEdit` paths, `Bash` commands, the last `TodoWrite`, `tool_result` blocks with `is_error`, and `isCompactSummary` messages.
   - Codex: reads `session_meta` and `turn_context` for metadata and `response_item` payloads (plus older top-level items). Skips `event_msg` to avoid duplicate user messages, and filters injected `<environment_context>`/AGENTS.md messages. Shell commands come from `function_call`, `local_shell_call`, and `tools.exec_command({cmd})` inside code-mode `exec` cells; edited files come from `apply_patch` headers (including `tools.apply_patch(...)` in cells), todos from `update_plan`, and errors from non-zero exit codes in outputs.
   - If a file yields no user messages, `_loaded` raises a clear "format may have changed" error that lists the record types it saw.
-- **Rendering** (`render`): fixed sections with size limits set as constants at the top of the file. Every inserted string passes through `Redactor`. The git section uses live repo state at run time.
+- **Subagents** (`with_subagents`): after picking a session, edited files from its subagents are merged in, ordered by timestamp. Claude subagents live in `projects/<dir>/<session-id>/subagents/*.jsonl` (all records `isSidechain`); Codex children are rollouts whose `parent_thread_id` points at the session (or at one of its children). Only edited files are merged, nothing else.
+- **Rendering** (`render`): fixed sections with size limits set as constants at the top of the file. Edited files in temp folders are dropped unless the repo itself is there. Errors keep their first and last halves. Every inserted string passes through `Redactor`. The git section uses live repo state at run time.
 - **Redaction** (`Redactor`): regexes for common key shapes, bearer tokens, JWTs, PEM private keys, URL credentials, and `KEY=value` style assignments. It over-redacts on purpose.
 - **Git** (`git`): read-only, with `--no-optional-locks`, `core.fsmonitor=false`, `--no-ext-diff`, and `GIT_TERMINAL_PROMPT=0`, so a hostile repo config can't run code.
 
@@ -54,7 +55,8 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 
 ## Known limitations and ideas (only if Tim wants them)
 
-- Redaction misses generic high-entropy strings and has false positives (for example `tokenizer: whitespace` gets redacted). Tighten only with tests on both sides.
+- Redaction misses generic high-entropy strings. Two false positives were fixed with tests on both sides (`tokenizer: ...`, and numeric values for keys ending in `tokens`, like `max_output_tokens: 8000`). Tighten further only the same way.
+- Identical consecutive errors are not deduplicated (commands are).
 - Old compressed Codex sessions need `--session`.
 - No Cursor, Gemini CLI, or OpenCode support. Each would be a new parser plus discovery function.
 - Rule-based extraction can't know the true next step. The `-m` note covers that today.
