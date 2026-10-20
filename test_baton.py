@@ -46,6 +46,7 @@ def claude_rows(cwd):
         {"type": "user", "isSidechain": True, "message": {"role": "user", "content": "SIDECHAIN MSG"}},
         {"type": "user", "isMeta": True, "message": {"role": "user", "content": "META MSG"}},
         {"type": "user", "message": {"role": "user", "content": "<command-name>/clear</command-name>"}},
+        {"type": "user", "message": {"role": "user", "content": "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>"}},
         {"type": "user", "timestamp": "2026-10-20T01:30:00.000Z",
          "message": {"role": "user", "content": "Now also add tests for the limiter"}},
         {"type": "assistant", "message": {"role": "assistant", "content": [
@@ -74,6 +75,63 @@ def codex_rows(cwd):
                                            {"step": "Migrate login", "status": "in_progress"}]})}},
         {"type": "event_msg", "payload": {"type": "user_message", "message": "duplicate, must be ignored"}},
     ]
+
+
+CODEX_USER_ID = "01a15878-4937-71b2-b9da-06fa265e94f3"
+CODEX_CHILD_ID = "01a15878-6b10-7a21-8c3e-1f2a3b4c5d6e"
+
+
+def _cell(*outputs, header="Script completed\nWall time 0.3 seconds\nOutput:\n"):
+    return [{"type": "input_text", "text": header}] + [{"type": "input_text", "text": json.dumps(o)} for o in outputs]
+
+
+def codex_code_mode_rows(cwd, sid=CODEX_USER_ID):
+    # Shapes copied from real 2026-10 rollouts: tools run from a JS "exec" cell, outputs are block lists.
+    patch = f"*** Begin Patch\n*** Update File: {cwd}/src/auth.py\n@@\n*** Add File: src/store.py\n+x\n*** End Patch\n"
+    cmd = 'rg -n "login" src && pytest -q'
+    return [
+        {"timestamp": "2026-10-20T02:00:00Z", "type": "session_meta", "payload": {
+            "id": sid, "session_id": sid, "cwd": cwd, "originator": "codex-tui", "source": "vscode",
+            "thread_source": "user", "git": {"branch": "dev/x"}}},
+        {"type": "turn_context", "payload": {"cwd": cwd, "turn_id": "t1", "model": "m"}},
+        {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [
+            {"type": "input_text", "text": "<permissions instructions>\nsandbox"}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": f"# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>x</INSTRUCTIONS>"},
+            {"type": "input_text", "text": "<environment_context>\n  <cwd>/x</cwd>\n</environment_context>"}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "<skill>\n<name>ship</name>\n<path>/x/SKILL.md</path>"}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Refactor the auth module to use sessions"}]}},
+        {"type": "event_msg", "payload": {"type": "item_completed"}},
+        {"type": "response_item", "payload": {"type": "reasoning", "summary": [], "encrypted_content": "zz"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input":
+            f"const r=await tools.exec_command({{cmd:{json.dumps(cmd)},max_output_tokens:8000}});\n"
+            'text(await tools.web__run({search_query:[{q:"x"}]}));\n'
+            'text(await tools.write_stdin({session_id:1,chars:"\\u0003"}));\n'}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c1", "output": _cell(
+            {"chunk_id": "a", "exit_code": 1, "output": "FAILED tests/test_auth.py::test_login"})}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c2",
+                                              "input": f"text(await tools.apply_patch({json.dumps(patch)}));\n"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c2", "output": _cell(
+            {"chunk_id": "b", "exit_code": 0, "output": "Success."})}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c3",
+                                              "input": "text(await tools.exec_command({cmd:'git status --short'}));"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c3",
+                                              "output": _cell(header="Script error: ReferenceError: r is not defined")}},
+        {"type": "response_item", "payload": {"type": "message", "role": "assistant", "phase": "final", "content": [
+            {"type": "output_text", "text": "Session store is in; login test still fails."}]}},
+    ]
+
+
+def codex_child_rows(cwd):
+    # A forked subagent thread: its own session_meta, then the parent's, then the copied parent history.
+    own = {"id": CODEX_CHILD_ID, "cwd": cwd, "thread_source": "subagent", "parent_thread_id": CODEX_USER_ID,
+           "source": {"subagent": {"thread_spawn": {"parent_thread_id": CODEX_USER_ID, "agent_role": "builder"}}}}
+    rows = codex_code_mode_rows(cwd)
+    return [{"type": "session_meta", "payload": own}] + rows + [
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "CHILD TASK: build the store"}]}}]
 
 
 class ParserTests(unittest.TestCase):
@@ -119,6 +177,30 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(s.todos[1], ("in_progress", "Migrate login"))
         self.assertEqual(s.cwd, "/work/proj")
         self.assertEqual(s.session_id, "019c0000-1111-2222-3333-444455556666")
+
+    def test_codex_code_mode(self):
+        f = self.tmp / f"rollout-2026-10-20T02-00-00-{CODEX_USER_ID}.jsonl"
+        jl(f, codex_code_mode_rows("/work/proj"))
+        s = baton.parse_codex(f)
+        self.assertEqual(s.users, ["Refactor the auth module to use sessions"])
+        self.assertEqual(s.assistants, ["Session store is in; login test still fails."])
+        self.assertEqual(s.commands, ['rg -n "login" src && pytest -q', "git status --short"])
+        self.assertEqual(list(s.files), ["/work/proj/src/auth.py", "src/store.py"])
+        self.assertEqual(len(s.errors), 2)
+        self.assertEqual(s.errors[0], "FAILED tests/test_auth.py::test_login")
+        self.assertIn("ReferenceError", s.errors[1])
+        self.assertEqual((s.cwd, s.branch, s.session_id), ("/work/proj", "dev/x", CODEX_USER_ID))
+
+    def test_codex_fork_keeps_its_own_id(self):
+        f = self.tmp / f"rollout-2026-10-20T02-05-00-{CODEX_CHILD_ID}.jsonl"
+        jl(f, codex_child_rows("/work/proj"))
+        self.assertEqual(baton.parse_codex(f).session_id, CODEX_CHILD_ID)
+        self.assertTrue(baton._codex_is_child(baton._head(f)))
+
+    def test_js_string_literals(self):
+        self.assertEqual(baton._js_str(r'"a \"b\"\nc"'), 'a "b"\nc')
+        self.assertEqual(baton._js_str(r"'it\'s'"), "it's")
+        self.assertEqual(baton._js_str(r"`x\ty`"), "x\ty")
 
     def test_unknown_format_gives_clear_error(self):
         f = self.tmp / "weird.jsonl"
@@ -258,6 +340,27 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Refactor the auth module", out)
         code, out, _ = self.call("--stdout", "--from", "claude")
         self.assertIn("Add rate limiting", out)
+
+    def test_codex_child_threads_are_ignored(self):
+        day = self.codex / "sessions" / "2026" / "10" / "20"
+        user = day / f"rollout-2026-10-20T02-00-00-{CODEX_USER_ID}.jsonl"
+        child = day / f"rollout-2026-10-20T02-05-00-{CODEX_CHILD_ID}.jsonl"
+        jl(user, codex_code_mode_rows(str(self.repo)))
+        jl(child, codex_child_rows(str(self.repo)))
+        now = os.path.getmtime(user)
+        os.utime(user, (now + 100, now + 100))
+        os.utime(child, (now + 200, now + 200))  # the child is newest, but must never be picked
+        code, out, _ = self.call("list")
+        self.assertEqual(out.count("codex"), 1, out)
+        code, out, _ = self.call("--stdout")
+        self.assertIn("Refactor the auth module", out)
+        self.assertNotIn("CHILD TASK", out)
+        code, out, err = self.call("--stdout", "--session", CODEX_USER_ID[:8])  # the prefix both ids share
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("CHILD TASK", out)
+        code, out, err = self.call("--stdout", "--session", CODEX_CHILD_ID)  # still readable when asked for
+        self.assertEqual(code, 0, err)
+        self.assertIn("CHILD TASK", out)
 
     def test_list(self):
         code, out, _ = self.call("list")

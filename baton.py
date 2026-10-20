@@ -242,6 +242,7 @@ _NOISE_PREFIXES = (
     "caveat: the messages below", "[request interrupted",
     "<environment_context>", "<user_instructions>", "<instructions>", "<turn_aborted>",
     "# agents.md instructions", "<permissions instructions>", "<user_action>",
+    "<task-notification>", "<skill>",
 )
 
 
@@ -322,6 +323,11 @@ _CODEX_ITEMS = {
 _PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.M)
 _PATCH_MOVE = re.compile(r"^\*\*\* Move to: (.+?)\s*$", re.M)
 _EXIT_RES = (re.compile(r"Process exited with code (-?\d+)"), re.compile(r"[Ee]xit code:? (-?\d+)"))
+# Code-mode Codex runs tools from a JS cell: tools.exec_command({cmd: "..."}), tools.apply_patch("...")
+_JS_STR = r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)"""
+_EXEC_CMD = re.compile(r"""tools\.exec_command\(\s*\{\s*["']?cmd["']?\s*:\s*""" + _JS_STR)
+_EXEC_PATCH = re.compile(r"""tools\.apply_patch\(\s*(?:\{\s*["']?(?:input|patch)["']?\s*:\s*)?""" + _JS_STR)
+_JS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r"}
 
 
 def _codex_id(path: Path) -> str:
@@ -331,6 +337,7 @@ def _codex_id(path: Path) -> str:
 
 def parse_codex(path: Path) -> Session:
     s = Session(agent="codex", path=path, session_id=_codex_id(path))
+    meta_seen = False
     for obj in _records(path, s):
         t = obj.get("type")
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else None
@@ -339,8 +346,10 @@ def parse_codex(path: Path) -> Session:
             p = payload or obj
             git = p.get("git") if isinstance(p.get("git"), dict) else {}
             s.note_meta(obj.get("timestamp") or p.get("timestamp"), p.get("cwd"), git.get("branch"))
-            if t != "turn_context" and p.get("id"):
+            if t != "turn_context" and p.get("id") and not meta_seen:
+                # Forked threads repeat the parent's session_meta after their own; the first one wins.
                 s.session_id = str(p["id"])
+                meta_seen = True
             continue
 
         if t == "response_item" and payload:
@@ -377,6 +386,26 @@ def _codex_cmd(args: dict) -> str:
     return str(cmd)
 
 
+def _js_str(lit: str) -> str:
+    if lit.startswith('"'):
+        try:
+            return str(json.loads(lit))
+        except ValueError:
+            pass
+    return re.sub(r"\\(.)", lambda m: _JS_ESCAPES.get(m.group(1), m.group(1)), lit[1:-1], flags=re.S)
+
+
+def _codex_exec(s: Session, src: str) -> None:
+    for m in _EXEC_PATCH.finditer(src):
+        patch = _js_str(m.group(1))
+        for p in _PATCH_FILE.findall(patch) + _PATCH_MOVE.findall(patch):
+            s.touch(p)
+    for m in _EXEC_CMD.finditer(src):
+        cmd = _js_str(m.group(1)).strip()
+        if cmd:
+            s.commands.append(cmd)
+
+
 def _codex_item(s: Session, rec: dict) -> None:
     kind = rec.get("type")
     if kind == "message":
@@ -396,6 +425,9 @@ def _codex_item(s: Session, rec: dict) -> None:
             raw = rec.get("arguments")
         else:
             raw = rec.get("input")
+        if name == "exec" and isinstance(raw, str):
+            _codex_exec(s, raw)
+            return
         args = _json_obj(raw)
         if name == "update_plan":
             plan = args.get("plan")
@@ -428,6 +460,15 @@ def _codex_item(s: Session, rec: dict) -> None:
 def _codex_output(rec: dict):
     out = rec.get("output")
     text, code = "", None
+    if isinstance(out, list):  # code-mode cell: a "Script ..." header block, then one JSON block per tool result
+        texts = [str(b.get("text", "")) for b in out if isinstance(b, dict) and b.get("text")]
+        if texts and texts[0].startswith(("Script failed", "Script error")):
+            return "\n".join(texts), 1
+        for t in texts[1:]:
+            obj = _json_obj(t)
+            if isinstance(obj.get("exit_code"), int) and obj["exit_code"] != 0:
+                return str(obj.get("output", "")), obj["exit_code"]
+        return "", None
     if isinstance(out, dict):
         text = str(out.get("content") or out.get("output") or "")
     elif isinstance(out, str):
@@ -476,7 +517,8 @@ def _codex_base() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
 
 
-def _first_cwd(path: Path) -> str:
+def _head(path: Path):
+    """The first record with a cwd, as a dict (its payload for Codex), or {}."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -490,10 +532,23 @@ def _first_cwd(path: Path) -> str:
                     continue
                 p = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
                 if p.get("cwd"):
-                    return str(p["cwd"])
+                    return p
     except OSError:
         pass
-    return ""
+    return {}
+
+
+def _first_cwd(path: Path) -> str:
+    return str(_head(path).get("cwd") or "")
+
+
+def _codex_is_child(meta: dict) -> bool:
+    """Subagent and guardian-review threads get their own rollout files; only user threads are handoff material."""
+    return (
+        bool(meta.get("parent_thread_id"))
+        or meta.get("thread_source") not in (None, "user")
+        or isinstance(meta.get("source"), dict)
+    )
 
 
 def _cwd_match(session_cwd: str, cwds: list) -> bool:
@@ -531,7 +586,12 @@ def codex_candidates(cwds: list) -> list:
     if not base.is_dir():
         return []
     files = sorted(base.rglob("rollout-*.jsonl"), key=_mtime, reverse=True)[:CODEX_SCAN_LIMIT]
-    return [f for f in files if _cwd_match(_first_cwd(f), cwds)]
+    out = []
+    for f in files:
+        meta = _head(f)
+        if _cwd_match(str(meta.get("cwd") or ""), cwds) and not _codex_is_child(meta):
+            out.append(f)
+    return out
 
 
 CANDIDATES = {"claude": claude_candidates, "codex": codex_candidates}
@@ -566,6 +626,8 @@ def load_explicit(ref: str) -> Session:
         hits += [("codex", f) for f in xb.rglob(f"rollout-*{ref}*.jsonl*")]
     if not hits:
         raise BatonError(f"No session matches '{ref}'. Try 'baton list'.")
+    if len(hits) > 1:  # Codex ids are time-ordered, so a short prefix also hits that session's subagent threads
+        hits = [h for h in hits if h[0] != "codex" or h[1].suffix == ".zst" or not _codex_is_child(_head(h[1]))] or hits
     if len(hits) > 1:
         names = ", ".join(f"{a}:{f.stem[-8:]}" for a, f in hits[:5])
         raise BatonError(f"'{ref}' matches several sessions ({names}). Use a longer prefix.")

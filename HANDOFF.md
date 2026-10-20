@@ -20,13 +20,14 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 ## Files
 
 - `baton.py`: the whole tool. Single file, Python 3.9+ target, standard library only, no network.
-- `test_baton.py`: 21 unittest tests with synthetic Claude Code and Codex fixtures. Run with `python3 -m unittest test_baton`.
+- `test_baton.py`: 25 unittest tests. The Claude Code and code-mode Codex fixtures use record shapes copied from real 2026-10 sessions; the older Codex fixture is kept for older rollouts. Run with `python3 -m unittest test_baton`.
 - `README.md`: user-facing docs.
 - `HANDOFF.md`: this file.
 
 ## Current state
 
-- All 21 tests pass on Python 3.12, Linux.
+- All 25 tests pass on Python 3.12 (Linux), 3.13 and 3.9.6 (macOS, Apple Silicon).
+- Checked against Tim's real sessions on 2026-10-20 (37 Claude Code files, 87 Codex rollouts). The Claude parser matched as written. The Codex parser needed five fixes: skip subagent and guardian-review rollouts, keep a forked thread's own id, read commands and patches from code-mode `exec` cells, read exit codes from block-list outputs, and let a short `--session` prefix ignore child threads.
 - An end-to-end demo on a scratch git repo produced a correct 1.3 KB handoff with 0600 permissions and `.baton/` added to `.git/info/exclude`.
 - One bug was found and fixed during testing: `baton list` printed unredacted secret prefixes in its preview line. A regression test covers it.
 
@@ -35,10 +36,10 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 - **CLI** (`main`, `_run`): `baton`, `baton to claude|codex`, `baton list`, plus `-m`, `--from`, `--session`, `--out`, `--stdout`, `--go`, `--no-launch`. `to X` reads the newest session from the *other* agent. Launch uses `os.execv` on POSIX and `subprocess.call` on Windows.
 - **Discovery** (`claude_candidates`, `codex_candidates`, `find_session`): matches sessions to the current directory, its realpath, and the git root. Picks the newest file across agents that has at least one real user message, trying up to 8 files.
   - Claude: `$CLAUDE_CONFIG_DIR` or `~/.claude`, under `projects/<cwd with non-alphanumerics replaced by '-'>/*.jsonl`. Falls back to scanning every project folder for a matching recorded `cwd`.
-  - Codex: `$CODEX_HOME` or `~/.codex`, under `sessions/**/rollout-*.jsonl`. Matches the `cwd` in the first lines; the newest 300 files are scanned. `.zst` files are skipped in discovery and only readable via `--session`.
+  - Codex: `$CODEX_HOME` or `~/.codex`, under `sessions/**/rollout-*.jsonl`. Matches the `cwd` in the first lines; the newest 300 files are scanned. `.zst` files are skipped in discovery and only readable via `--session`. Child threads (`parent_thread_id`, `thread_source` other than `user`, or a dict `source`) are skipped.
 - **Parsers** (`parse_claude`, `parse_codex`): normalize both formats into a `Session` with users, assistants, edited files, commands, errors, todos, and the compaction summary.
   - Claude: skips `isSidechain`, `isMeta`, thinking blocks, and slash-command/system-reminder noise. Reads `Edit`/`Write`/`MultiEdit`/`NotebookEdit` paths, `Bash` commands, the last `TodoWrite`, `tool_result` blocks with `is_error`, and `isCompactSummary` messages.
-  - Codex: reads `session_meta` and `turn_context` for metadata and `response_item` payloads (plus older top-level items). Skips `event_msg` to avoid duplicate user messages, and filters injected `<environment_context>`/AGENTS.md messages. Shell commands come from `function_call` and `local_shell_call`, edited files from `apply_patch` headers, todos from `update_plan`, and errors from non-zero exit codes in outputs.
+  - Codex: reads `session_meta` and `turn_context` for metadata and `response_item` payloads (plus older top-level items). Skips `event_msg` to avoid duplicate user messages, and filters injected `<environment_context>`/AGENTS.md messages. Shell commands come from `function_call`, `local_shell_call`, and `tools.exec_command({cmd})` inside code-mode `exec` cells; edited files come from `apply_patch` headers (including `tools.apply_patch(...)` in cells), todos from `update_plan`, and errors from non-zero exit codes in outputs.
   - If a file yields no user messages, `_loaded` raises a clear "format may have changed" error that lists the record types it saw.
 - **Rendering** (`render`): fixed sections with size limits set as constants at the top of the file. Every inserted string passes through `Redactor`. The git section uses live repo state at run time.
 - **Redaction** (`Redactor`): regexes for common key shapes, bearer tokens, JWTs, PEM private keys, URL credentials, and `KEY=value` style assignments. It over-redacts on purpose.
@@ -46,14 +47,10 @@ Existing tools were audited by reading their source: TStansel/handoff (Rust), ha
 
 ## What is NOT verified yet (start here)
 
-1. **Real session files.** Both parsers were written from memory of the formats and tested only against synthetic fixtures. This is the biggest risk. Run baton against real Claude Code and Codex sessions, and adjust the parsers and fixtures to match what is actually on disk. Check especially:
-   - the Claude project folder naming (the `re.sub` encoding in `claude_candidates`)
-   - current Codex record types and field names (`payload.type`, `arguments` vs `input`, output and exit code shape)
-   - Codex injected-message prefixes in `_NOISE_PREFIXES`
-   - where current Claude Code versions store subagent transcripts
-2. **macOS.** Tim uses a MacBook Air M3, and it hasn't been run on macOS. Watch for `/tmp` vs `/private/tmp` realpath differences and launching `claude`/`codex` via `os.execv`.
-3. **Python 3.9 to 3.11.** The 3.9+ target is claimed but only 3.12 was run.
-4. **Windows.** The code path exists but is untested.
+1. **Launching via `os.execv` on macOS.** Reading and writing are verified on macOS; `baton to claude|codex` actually starting the agent is not.
+2. **Python 3.10 and 3.11.** 3.9, 3.12 and 3.13 pass.
+3. **Windows.** The code path exists but is untested.
+4. **Formats keep moving.** Re-run against real sessions after Claude Code or Codex updates. Claude subagents now live in `projects/<dir>/<session-id>/subagents/`, which the top-level glob already ignores. Neither Claude `TodoWrite` nor Codex `update_plan` showed up in Tim's sessions, so the task list section will rarely appear.
 
 ## Known limitations and ideas (only if Tim wants them)
 
